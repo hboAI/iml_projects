@@ -1,12 +1,12 @@
 from pathlib import Path
-
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 
 """
 README FIRST
@@ -35,7 +35,7 @@ https://pytorch.org/tutorials/recipes/recipes/tensorboard_with_pytorch.html
 # https://pytorch.org/docs/stable/notes/mps.html
 
 # It is important that your model and all data are on the same device.
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "mps")
 
 
 def get_data(**kwargs):
@@ -54,134 +54,144 @@ def get_data(**kwargs):
     the number of test samples, C is the number of channels (1 for grayscale),
     H is the height of the image, and W is the width of the image.
     """
-    # Load the training data
-    train_data = np.load("train_data.npz")["data"]
-
-    # Make the training data a tensor
-    train_data = torch.tensor(train_data, dtype=torch.float32)
-
-    # Load the test data
+    train_data = np.load("train_data.npz")["data"]  # Shape (N, 28, 28)
+    
+    # Convert to tensor with channel dimension
+    train_data = torch.tensor(train_data, dtype=torch.float32)  # Now (N, 1, 28, 28)
+    
+    # Load test data
     test_data_input = np.load("test_data.npz")["data"]
-
-    # Make the test data a tensor
     test_data_input = torch.tensor(test_data_input, dtype=torch.float32)
-
-    ########################################
-    # TODO: Given the original training images, create the input images and the
-    # label images to train your model. 
-    # Replace the two placholder lines below (which currently just copy the
-    # training data) with your own implementation.
+    
+    # Create masked inputs
+    def apply_mask(image):
+        masked_image = image.clone()
+        masked_image[:, 10:18, 10:18] = 0  # Apply mask on spatial dimensions
+        return masked_image
+    
+    # Apply mask while preserving channels
+    train_data_input = torch.stack([apply_mask(img) for img in train_data])
     train_data_label = train_data.clone()
-    train_data_input = train_data.clone()
-
-    # Visualize the training data if needed
-    # Set to False if you don't want to save the images
-    if True:
-        # Create the output directory if it doesn't exist
-        if not Path("train_image_output").exists():
-            Path("train_image_output").mkdir()
-        for i in tqdm(range(20), desc="Plotting train images"):
-            # Show the training and the target image side by side
-            plt.subplot(1, 2, 1)
-            plt.imshow(train_data_input[i].squeeze(), cmap="gray")
-            plt.title("Training Input")
-            plt.subplot(1, 2, 2)
-            plt.title("Training Label")
-            plt.imshow(train_data_label[i].squeeze(), cmap="gray")
-
-            plt.savefig(f"train_image_output/image_{i}.png")
-            plt.close()
-
+    
     return train_data_input, train_data_label, test_data_input
-
-
 def train_model(train_data_input, train_data_label, **kwargs):
-    """
-    Train the model. Fill in the details of the data loader, the loss function,
-    the optimizer, and the training loop.
-
-    Args:
-    - train_data_input: Tensor[N_train_samples, C, H, W]
-    - train_data_label: Tensor[N_train_samples, C, H, W]
-    - kwargs: Additional arguments that you might find useful - not necessary
-
-    Returns:
-    - model: torch.nn.Module
-    """
-    model = Model()
-    model.train()
-    model.to(device)
-
-    # TODO: Dummy criterion - change this to the correct loss function
-    # https://pytorch.org/docs/stable/nn.html#loss-functions
-    criterion = lambda x, y: torch.mean((x))
-    # TODO: Dummy optimizer - change this to a more suitable optimizer
-    optimizer = torch.optim.SGD(model.parameters())
-
-    # TODO: Correctly setup the dataloader - the below is just a placeholder
-    # Also consider that you might not want to use the entire dataset for
-    # training alone
-    # (batch_size needs to be changed)
-    batch_size = 1
+    # Set up device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
+    
+    # Create dataset and split into train/validation
     dataset = TensorDataset(train_data_input, train_data_label)
-    # Consider the shuffle parameter and other parameters of the DataLoader
-    # class (see
-    # https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader)
-    data_loader = DataLoader(dataset, batch_size=batch_size)
-
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    
+    # Create data loaders
+    batch_size = 8
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Initialize model and move to device
+    model = Model().to(device)
+    
+    # Define loss functions
+    criterion = nn.SmoothL1Loss(beta=1.0)  # Huber loss
+    mse_criterion = nn.MSELoss()  # For tracking MSE
+    
+    # Set up optimizer and scheduler
+    optimizer = optim.SGD(model.parameters(), 
+                         lr=0.1, 
+                         momentum=0.9, 
+                         weight_decay=0.0001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
+                                                    mode='min', 
+                                                    factor=0.1,
+                                                    patience=5,
+                                                    verbose=True)
+    
     # Training loop
-    # TODO: Modify the training loop in case you need to
-
-    # TODO: The value of n_epochs is just a placeholder and likely needs to be
-    # changed
-    n_epochs = 1
-
-    for epoch in range(n_epochs):
-        for x, y in tqdm(
-            data_loader, desc=f"Training Epoch {epoch}", leave=False
-        ):
-            x, y = x.to(device), y.to(device)
+    for epoch in range(10):
+        model.train()
+        train_mse = 0.0
+        
+        # Training phase
+        for inputs, targets in train_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
             optimizer.zero_grad()
-            output = model(x)
-            loss = criterion(output, y)
+            
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            
+            # Backward pass and optimize
             loss.backward()
             optimizer.step()
-
-        print(f"Epoch {epoch} loss: {loss.item()}")
-
+            
+            # Calculate MSE for tracking
+            with torch.no_grad():
+                train_mse += mse_criterion(outputs, targets).item() * inputs.size(0)
+        
+        # Calculate average training MSE
+        train_mse /= len(train_dataset)
+        
+        # Validation phase
+        model.eval()
+        val_mse = 0.0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                
+                outputs = model(inputs)
+                val_mse += mse_criterion(outputs, targets).item() * inputs.size(0)
+        
+        val_mse /= len(val_dataset)
+        
+        # Update learning rate scheduler
+        scheduler.step(val_mse)
+        
+        # Print progress
+        print(f"Epoch [{epoch+1}/10] "
+              f"Train MSE: {train_mse:.4f} - "
+              f"Val MSE: {val_mse:.4f}")
+    
     return model
 
 
-# TODO: define a model. Here, a basic MLP model is defined. You can completely
-# change this model - and are encouraged to do so.
 class Model(nn.Module):
-    """
-    Implement your model here.
-    """
-
     def __init__(self):
-        """
-        The constructor of the model.
-        """
-        super().__init__()
-        self.fc = nn.Linear(784, 784)
+        super(Model, self).__init__()
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+            nn.ReLU(),
+            
+            nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        """
-        The forward pass of the model.
-
-        input: x: torch.Tensor, the input to the model
-
-        output: x: torch.Tensor, the output of the model
-        """
-        # Flatten the image in the last two dimensions
-        x = x.view(x.shape[0], -1)
-        x = self.fc(x)
-        x = F.relu(x)
-        # Reshape the image to the original shape
-        x = x.view(x.shape[0], 1, 28, 28)
+        x = self.encoder(x)
+        x = self.decoder(x)
         return x
 
+# Example usage:
+# model = Model()
+# optimizer = optim.Adam(model.parameters(), lr=0.1)
+# scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+# criterion = nn.MSELoss()
 
 def test_model(model, test_data_input):
     """
@@ -258,23 +268,25 @@ def test_model(model, test_data_input):
 
 def main():
     seed = 0
-    # Reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
-    torch.backends.cudnn.deterministic = True
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-    # You don't need to change the code below
-    # Load the data
-    train_data_input, train_data_label, test_data_input = get_data()
-    # Train the model
+    # Load data
+    try:
+        train_data_input, train_data_label, test_data_input = get_data()
+    except FileNotFoundError:
+        print("Error: Could not find data files. Please ensure:")
+        print("- train_data.npz and test_data.npz exist in the current directory")
+        print("- The files are downloaded from the course resources")
+        return
+
     model = train_model(train_data_input, train_data_label)
-
-    # Test the model (this also generates the submission file)
-    # The name of the submission file is submit_this_test_data_output.npz
     test_model(model, test_data_input)
-
-    return None
-
 
 if __name__ == "__main__":
     main()
+

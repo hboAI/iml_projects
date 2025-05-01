@@ -35,8 +35,8 @@ https://pytorch.org/tutorials/recipes/recipes/tensorboard_with_pytorch.html
 # https://pytorch.org/docs/stable/notes/mps.html
 
 # It is important that your model and all data are on the same device.
-#device = torch.device("cuda:0" if torch.cuda.is_available() else "mps") -> for mac
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "mps")
+#device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def get_data(**kwargs):
@@ -76,33 +76,7 @@ def get_data(**kwargs):
     
     return train_data_input, train_data_label, test_data_input
 
-class AsymmetricSmoothL1Loss(nn.Module):
-    def __init__(self, beta=1.0, overestimation_factor=2.0, underestimation_factor=1.0):
-        super(AsymmetricSmoothL1Loss, self).__init__()
-        self.beta = beta
-        self.overestimation_factor = overestimation_factor
-        self.underestimation_factor = underestimation_factor
 
-    def forward(self, input, target):
-        # Compute the absolute error
-        error = torch.abs(input - target)
-
-        # Asymmetric overestimation (prediction > target) and underestimation (prediction < target)
-        overestimation_mask = (input > target).float()
-        underestimation_mask = (input < target).float()
-
-        # Apply different factors based on over/underestimation
-        loss = torch.where(overestimation_mask == 1, 
-                           self.overestimation_factor * error, 
-                           self.underestimation_factor * error)
-
-        # Apply Huber loss based on error and beta
-        loss = torch.where(loss < self.beta, 
-                           0.5 * loss ** 2, 
-                           self.beta * (loss - 0.5 * self.beta))
-
-        # Return the mean loss
-        return loss.mean()
 
 
 def train_model(train_data_input, train_data_label, **kwargs):
@@ -116,7 +90,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
     # Create data loaders
-    batch_size = 50
+    batch_size = 10
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
@@ -124,8 +98,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
     model = Model().to(device)
     
     # Define loss functions
-    #criterion = nn.SmoothL1Loss(beta=1.0)  # Huber loss
-    criterion = AsymmetricSmoothL1Loss(beta=1.0, overestimation_factor=2.0, underestimation_factor=1.0)
+    criterion = nn.SmoothL1Loss(beta=1.0)  # Huber loss
     mse_criterion = nn.MSELoss()  # For tracking MSE
     
     # Set up optimizer and scheduler
@@ -183,13 +156,26 @@ def train_model(train_data_input, train_data_label, **kwargs):
         scheduler.step(val_mse)
         
         # Print progress
-        print(f"Epoch [{epoch+1}/10] "
+        print(f"Epoch [{epoch+1}/20] "
               f"Train MSE: {train_mse:.4f} - "
               f"Val MSE: {val_mse:.4f}")
     
     return model
 
 
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
@@ -205,6 +191,8 @@ class Model(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
         
+        # Spatial attention
+        self.spatial_attention = SpatialAttention(kernel_size=7)
         # Decoder
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
@@ -216,6 +204,11 @@ class Model(nn.Module):
 
     def forward(self, x):
         x = self.encoder(x)
+
+        # Apply spatial attention
+        attention = self.spatial_attention(x)
+        x = x * attention
+
         x = self.decoder(x)
         return x
 

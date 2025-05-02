@@ -36,7 +36,6 @@ https://pytorch.org/tutorials/recipes/recipes/tensorboard_with_pytorch.html
 
 # It is important that your model and all data are on the same device.
 device = torch.device("cuda:0" if torch.cuda.is_available() else "mps")
-#device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def get_data(**kwargs):
@@ -75,10 +74,6 @@ def get_data(**kwargs):
     train_data_label = train_data.clone()
     
     return train_data_input, train_data_label, test_data_input
-
-
-
-
 def train_model(train_data_input, train_data_label, **kwargs):
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
@@ -90,7 +85,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
     # Create data loaders
-    batch_size = 10
+    batch_size = 8
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
@@ -109,7 +104,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
                                                     mode='min', 
                                                     factor=0.1,
-                                                    patience=5,
+                                                    patience=2,
                                                     verbose=True)
     
     # Training loop
@@ -163,90 +158,35 @@ def train_model(train_data_input, train_data_label, **kwargs):
     return model
 
 
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-    
-
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
         
         # Encoder
-        self.conv1 = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
-        
-        self.conv2 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
         
         # Decoder
-        self.decoder_up1 = nn.Sequential(
+        self.decoder = nn.Sequential(
             nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-            nn.ReLU()
-        )
-        
-        # Fusion convolution to combine skip connection and decoder features
-        self.fusion_conv = nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1)
-        self.fusion_relu = nn.ReLU()
-        
-        self.decoder_up2 = nn.Sequential(
+            nn.ReLU(),
+            
             nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        # Encoder
-        f1 = self.conv1(x)  # Shape: [N, 32, 14, 14] (skip connection feature)
-        f2 = self.conv2(f1)  # Shape: [N, 64, 7, 7] (bottleneck)
-        
-        # Decoder
-        d1 = self.decoder_up1(f2)  # Shape: [N, 32, 14, 14]
-        
-        # Concatenate skip connection (f1) with decoder features (d1)
-        d1 = torch.cat([f1, d1], dim=1)  # Shape: [N, 32+32, 14, 14]
-        
-        # Fuse concatenated features
-        d1 = self.fusion_conv(d1)  # Shape: [N, 32, 14, 14]
-        d1 = self.fusion_relu(d1)
-        
-        # Final upsampling
-        x = self.decoder_up2(d1)  # Shape: [N, 1, 28, 28]
-        
+        x = self.encoder(x)
+        x = self.decoder(x)
         return x
+
 # Example usage:
 # model = Model()
 # optimizer = optim.Adam(model.parameters(), lr=0.1)
@@ -349,4 +289,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

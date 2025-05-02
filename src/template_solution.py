@@ -95,11 +95,10 @@ def train_model(train_data_input, train_data_label, **kwargs):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     # Initialize model and move to device
-    model = Model().to(device)
+    model = kwargs.get('model', Model()).to(device)  # Allow custom model via kwargs
     
-    # Define loss functions
-    criterion = nn.SmoothL1Loss(beta=1.0)  # Huber loss
-    mse_criterion = nn.MSELoss()  # For tracking MSE
+    # Define loss function
+    mse_criterion = nn.MSELoss(reduction='sum')  # Sum for masked loss
     
     # Set up optimizer and scheduler
     optimizer = optim.SGD(model.parameters(), 
@@ -122,11 +121,16 @@ def train_model(train_data_input, train_data_label, **kwargs):
             inputs = inputs.to(device)
             targets = targets.to(device)
             
+            # Generate mask (masked pixels are 0)
+            mask = (inputs == 0).float().to(device)  # Shape: [batch_size, 1, 28, 28]
+            
             optimizer.zero_grad()
             
             # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs = model(inputs, mask)  # Model takes inputs and mask
+            
+            # Compute loss on masked regions
+            loss = mse_criterion(outputs * mask, targets * mask) / mask.sum()
             
             # Backward pass and optimize
             loss.backward()
@@ -134,7 +138,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
             
             # Calculate MSE for tracking
             with torch.no_grad():
-                train_mse += mse_criterion(outputs, targets).item() * inputs.size(0)
+                train_mse += mse_criterion(outputs * mask, targets * mask).item() / mask.sum().item() * inputs.size(0)
         
         # Calculate average training MSE
         train_mse /= len(train_dataset)
@@ -147,8 +151,14 @@ def train_model(train_data_input, train_data_label, **kwargs):
                 inputs = inputs.to(device)
                 targets = targets.to(device)
                 
-                outputs = model(inputs)
-                val_mse += mse_criterion(outputs, targets).item() * inputs.size(0)
+                # Generate mask
+                mask = (inputs == 0).float().to(device)  # Shape: [batch_size, 1, 28, 28]
+                
+                # Forward pass
+                outputs = model(inputs, mask)
+                
+                # Calculate MSE on masked regions
+                val_mse += mse_criterion(outputs * mask, targets * mask).item() / mask.sum().item() * inputs.size(0)
         
         val_mse /= len(val_dataset)
         
@@ -162,21 +172,6 @@ def train_model(train_data_input, train_data_label, **kwargs):
     
     return model
 
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-    
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
@@ -196,16 +191,30 @@ class ChannelAttention(nn.Module):
         out = avg_out + max_out
         return self.sigmoid(out)
 
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
         
         # Encoder
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv1_pre_pool = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=3, padding=1),  # Input: [image, mask]
+            nn.ReLU()
         )
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         self.conv2 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
@@ -219,43 +228,73 @@ class Model(nn.Module):
             nn.ReLU()
         )
         
-        # Fusion convolution to combine skip connection and decoder features
-        self.fusion_conv = nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1)
-        self.fusion_relu = nn.ReLU()
+        # Spatial attention for first skip connection
+        self.attention1 = SpatialAttention(kernel_size=7)
+        
+        # Fusion convolution for first skip connection (14x14)
+        self.fusion_conv1 = nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1)
+        self.fusion_relu1 = nn.ReLU()
         
         self.decoder_up2 = nn.Sequential(
-            nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2),
-            nn.Sigmoid()
+            nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2)
         )
+        
+        # Spatial attention for second skip connection
+        self.attention2 = SpatialAttention(kernel_size=7)
+        
+        # Fusion convolution for second skip connection (28x28)
+        self.fusion_conv2 = nn.Conv2d(32 + 1, 1, kernel_size=3, padding=1)
+        self.final_activation = nn.Tanh()  # Residual in [-1, 1]
 
-    def forward(self, x):
+    def forward(self, x_corr, mask):
+        # Input: x_corr [N, 1, 28, 28], mask [N, 1, 28, 28]
+        # Concatenate corrupted image and mask
+        x = torch.cat([x_corr, mask], dim=1)  # Shape: [N, 2, 28, 28]
+        
         # Encoder
-        f1 = self.conv1(x)  # Shape: [N, 32, 14, 14] (skip connection feature)
-        f2 = self.conv2(f1)  # Shape: [N, 64, 7, 7] (bottleneck)
+        f0 = self.conv1_pre_pool(x)  # Shape: [N, 32, 28, 28]
+        f1 = self.pool1(f0)  # Shape: [N, 32, 14, 14]
+        f2 = self.conv2(f1)  # Shape: [N, 64, 7, 7]
         
         # Decoder
         d1 = self.decoder_up1(f2)  # Shape: [N, 32, 14, 14]
         
-        # Concatenate skip connection (f1) with decoder features (d1)
+        # First skip connection with attention
+        attn1 = self.attention1(f1)  # Shape: [N, 1, 14, 14]
+        f1 = f1 * attn1  # Apply attention to enhance edges
         d1 = torch.cat([f1, d1], dim=1)  # Shape: [N, 32+32, 14, 14]
         
-        # Fuse concatenated features
-        d1 = self.fusion_conv(d1)  # Shape: [N, 32, 14, 14]
-        d1 = self.fusion_relu(d1)
+        # Fuse first skip connection
+        d1 = self.fusion_conv1(d1)  # Shape: [N, 32, 14, 14]
+        d1 = self.fusion_relu1(d1)
         
-        # Final upsampling
-        x = self.decoder_up2(d1)  # Shape: [N, 1, 28, 28]
+        # Second upsampling
+        d2 = self.decoder_up2(d1)  # Shape: [N, 1, 28, 28]
         
-        return x
-# Example usage:
-# model = Model()
-# optimizer = optim.Adam(model.parameters(), lr=0.1)
-# scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
-# criterion = nn.MSELoss()
+        # Second skip connection with attention
+        attn2 = self.attention2(f0)  # Shape: [N, 1, 28, 28]
+        f0 = f0 * attn2  # Apply attention to enhance edges
+        d2 = torch.cat([f0, d2], dim=1)  # Shape: [N, 32+1, 28, 28]
+        
+        # Predict residual
+        residual = self.fusion_conv2(d2)  # Shape: [N, 1, 28, 28]
+        residual = self.final_activation(residual)  # Residual in [-1, 1]
+        
+        # Combine with input
+        output = x_corr + mask * residual
+        output = torch.clamp(output, 0, 1)  # Ensure output in [0, 1]
+        
+        return output
+
+from pathlib import Path
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torch
 
 def test_model(model, test_data_input):
     """
-    Uses your model to predict the ouputs for the test data. Saves the outputs
+    Uses your model to predict the outputs for the test data. Saves the outputs
     as a binary file. This file needs to be submitted. This function does not
     need to be modified except for setting the batch_size value. If you choose
     to modify it otherwise, please ensure that the generating and saving of the
@@ -272,15 +311,18 @@ def test_model(model, test_data_input):
         test_data_input = test_data_input.to(device)
         # Predict the output batch-wise to avoid memory issues
         test_data_output = []
-        # TODO: You can increase or decrease this batch size depending on your
-        # memory requirements of your computer / model
-        # This will not affect the performance of the model and your score
+        # Batch size for inference
         batch_size = 64
         for i in tqdm(
             range(0, test_data_input.shape[0], batch_size),
             desc="Predicting test output",
         ):
-            output = model(test_data_input[i : i + batch_size])
+            # Generate mask for the batch
+            batch_input = test_data_input[i : i + batch_size]
+            mask = (batch_input == 0).float().to(device)  # Shape: [batch_size, 1, 28, 28]
+            
+            # Forward pass with input and mask
+            output = model(batch_input, mask)
             test_data_output.append(output.cpu())
         test_data_output = torch.cat(test_data_output)
 
@@ -307,14 +349,13 @@ def test_model(model, test_data_input):
     np.savez_compressed(
         "submit_this_test_data_output.npz", data=save_data)
 
-    # You can plot the output if you want
-    # Set to False if you don't want to save the images
+    # Plot the output if desired
     if True:
         # Create the output directory if it doesn't exist
         if not Path("test_image_output").exists():
             Path("test_image_output").mkdir()
         for i in tqdm(range(20), desc="Plotting test images"):
-            # Show the training and the target image side by side
+            # Show the test input and output side by side
             plt.subplot(1, 2, 1)
             plt.title("Test Input")
             plt.imshow(test_data_input[i].squeeze().cpu().numpy(), cmap="gray")
@@ -324,7 +365,6 @@ def test_model(model, test_data_input):
 
             plt.savefig(f"test_image_output/image_{i}.png")
             plt.close()
-
 
 def main():
     seed = 0

@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -98,12 +99,14 @@ class Model(nn.Module):
         )
         
         # Fusion convolution to combine skip connection and decoder features
-        self.fusion_conv = nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1)
+        self.fusion_conv = nn.Conv2d(65, 32, kernel_size=3, padding=1) 
         self.fusion_relu = nn.ReLU()
         
         self.decoder_final = nn.Sequential(
-            nn.Conv2d(32, 1, kernel_size=3, padding=1),  # Output: [N, 1, 14, 14]
-            nn.Tanh()  # Residual in [-1, 1]
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),  # Additional layer
+            nn.ReLU(),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),   # Original final layer
+            nn.Tanh()
         )
         
         # Crop and upsample to 8x8
@@ -112,6 +115,7 @@ class Model(nn.Module):
     def forward(self, x):
         # Input: x [N, 1, 28, 28]
         # Save input for center slicing
+        e0 = x
         input_image = x
         
         # Encoder
@@ -122,7 +126,11 @@ class Model(nn.Module):
         d1 = self.decoder_up1(f2)  # Shape: [N, 32, 14, 14]
         
         # Concatenate skip connection (f1) with decoder features (d1)
-        d1 = torch.cat([f1, d1], dim=1)  # Shape: [N, 32+32, 14, 14]
+        d1 = torch.cat([
+              d1,
+              f1,
+              F.avg_pool2d(e0, 2) 
+              ], dim=1)  # Shape: [N, 32+32, 14, 14]
         
         # Fuse concatenated features
         d1 = self.fusion_conv(d1)  # Shape: [N, 32, 14, 14]
@@ -139,19 +147,22 @@ class Model(nn.Module):
         
         return output
 
+
+
+
 class OneCycleScheduler:
     """
-    Implements 1Cycle Learning Rate and Momentum scheduling.
+    Implements 1Cycle Learning Rate and Momentum (beta1 for Adam) scheduling.
     - LR increases from lr_min to lr_max, then decreases to lr_min/100.
-    - Momentum decreases from mom_max to mom_min, then increases back.
+    - Beta1 decreases from beta1_max to beta1_min, then increases back.
     """
-    def __init__(self, optimizer, lr_max, mom_max, mom_min, total_steps, div_factor=10, final_div_factor=100):
+    def __init__(self, optimizer, lr_max, beta1_max, beta1_min, total_steps, div_factor=10, final_div_factor=100):
         self.optimizer = optimizer
         self.lr_max = lr_max
         self.lr_min = lr_max / div_factor
         self.final_lr = lr_max / final_div_factor
-        self.mom_max = mom_max
-        self.mom_min = mom_min
+        self.beta1_max = beta1_max
+        self.beta1_min = beta1_min
         self.total_steps = total_steps
         self.half_steps = total_steps // 2
         self.step_count = 0
@@ -160,20 +171,20 @@ class OneCycleScheduler:
         self.step_count += 1
         # Compute interpolation factor (0 to 1 for first half, 1 to 0 for second half)
         if self.step_count <= self.half_steps:
-            # Phase 1: Increase LR, decrease momentum
+            # Phase 1: Increase LR, decrease beta1
             frac = self.step_count / self.half_steps
             lr = self.lr_min + frac * (self.lr_max - self.lr_min)
-            mom = self.mom_max - frac * (self.mom_max - self.mom_min)
+            beta1 = self.beta1_max - frac * (self.beta1_max - self.beta1_min)
         else:
-            # Phase 2: Decrease LR, increase momentum
+            # Phase 2: Decrease LR, increase beta1
             frac = (self.step_count - self.half_steps) / self.half_steps
             lr = self.lr_max - frac * (self.lr_max - self.final_lr)
-            mom = self.mom_min + frac * (self.mom_max - self.mom_min)
+            beta1 = self.beta1_min + frac * (self.beta1_max - self.beta1_min)
         
         # Update optimizer parameters
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
-            param_group['momentum'] = mom
+            param_group['betas'] = (beta1, param_group['betas'][1])  # Update beta1, keep beta2
 
 def train_model(train_data_input, train_data_label, **kwargs):
     # Set up device
@@ -186,7 +197,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
     # Create data loaders
-    batch_size = 8
+    batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
@@ -198,21 +209,23 @@ def train_model(train_data_input, train_data_label, **kwargs):
     mse_criterion = nn.MSELoss(reduction='sum')  # For tracking MSE
     
     # Set up optimizer
-    optimizer = optim.SGD(model.parameters(), 
-                         lr=0.001,  # Initial LR, will be overridden by scheduler
-                         momentum=0.95,  # Initial momentum, will be overridden
-                         weight_decay=0.0001)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=0.0001,  # Initial LR, will be overridden by scheduler
+        betas=(0.9, 0.999),  # Initial (beta1, beta2), beta1 will be overridden
+        weight_decay=0.0001
+    )
     
     # Set up 1Cycle scheduler
-    total_epochs = 30
+    total_epochs = 50
     steps_per_epoch = len(train_loader)
     total_steps = total_epochs * steps_per_epoch
     scheduler = OneCycleScheduler(
         optimizer,
-        lr_max=0.01,           # Max learning rate
-        mom_max=0.95,          # Max momentum
-        mom_min=0.85,          # Min momentum
-        total_steps=total_steps,
+        lr_max=3e-4,
+        beta1_max=0.95,
+        beta1_min=0.8,  # Wider momentum swing
+        total_steps=total_epochs * len(train_loader),  # Ensure this matches
         div_factor=10,         # lr_min = lr_max / div_factor
         final_div_factor=100   # final_lr = lr_max / final_div_factor
     )
@@ -239,7 +252,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
             
             # Compute Huber loss on 8x8 region
             huber_loss = huber_criterion(outputs * center_mask, center_targets * center_mask) / (center_mask.sum() + 1e-8)
-            
+            mse_loss = mse_criterion(outputs * center_mask, center_targets * center_mask) / (center_mask.sum() + 1e-8)
             # Add gradient loss for edge sharpness
             outputs_squeezed = outputs.squeeze(1)  # Shape: [batch_size, 8, 8]
             targets_squeezed = center_targets.squeeze(1)  # Shape: [batch_size, 8, 8]
@@ -254,7 +267,8 @@ def train_model(train_data_input, train_data_label, **kwargs):
                          F.l1_loss(grad_outputs_y * mask_squeezed, grad_targets_y * mask_squeezed)) / (mask_squeezed.sum() + 1e-8)
             
             # Total loss
-            loss = huber_loss + 0.1 * grad_loss
+            #loss = huber_loss + 0.1 * grad_loss
+            loss = 0.7*huber_loss + 0.3*mse_loss + 0.1*grad_loss  # Adjusted weights
             
             # Backward pass and optimize
             loss.backward()
@@ -291,14 +305,14 @@ def train_model(train_data_input, train_data_label, **kwargs):
         
         val_mse /= len(val_dataset)
         
-        # Print progress with current learning rate and momentum
+        # Print progress with current learning rate and beta1
         current_lr = optimizer.param_groups[0]['lr']
-        current_mom = optimizer.param_groups[0]['momentum']
+        current_beta1 = optimizer.param_groups[0]['betas'][0]
         print(f"Epoch [{epoch+1}/{total_epochs}] "
               f"Train MSE: {train_mse:.4f} - "
               f"Val MSE: {val_mse:.4f} - "
               f"LR: {current_lr:.6f} - "
-              f"Momentum: {current_mom:.4f}")
+              f"Beta1: {current_beta1:.4f}")
     
     return model
 

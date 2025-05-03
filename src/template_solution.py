@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import keras
 
 """
 README FIRST
@@ -38,7 +39,6 @@ https://pytorch.org/tutorials/recipes/recipes/tensorboard_with_pytorch.html
 device = torch.device("cuda:0" if torch.cuda.is_available() else "mps")
 #device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-
 def get_data(**kwargs):
     """
     Get the training and test data. The data files are assumed to be in the
@@ -55,11 +55,11 @@ def get_data(**kwargs):
     train_data = np.load("train_data.npz")["data"]  # Shape (N, 28, 28)
     
     # Convert to tensor with channel dimension and normalize to [0, 1]
-    train_data = torch.tensor(train_data, dtype=torch.float32) / 255.0  # Shape: (N, 1, 28, 28)
+    train_data = torch.tensor(train_data, dtype=torch.float32) / 255.0 
     
     # Load test data
     test_data_input = np.load("test_data.npz")["data"]
-    test_data_input = torch.tensor(test_data_input, dtype=torch.float32) / 255.0  # Shape: (N_test, 1, 28, 28)
+    test_data_input = torch.tensor(test_data_input, dtype=torch.float32) / 255.0
     
     # Create masked inputs
     def apply_mask(image):
@@ -74,57 +74,106 @@ def get_data(**kwargs):
     return train_data_input, train_data_label, test_data_input
 
 
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+        
+        # Encoder
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)  # Downsample to 14x14
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)  # Downsample to 7x7
+        )
+        
+        # Decoder
+        self.decoder_up1 = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),  # Upsample to 14x14
+            nn.ReLU()
+        )
+        
+        # Fusion convolution to combine skip connection and decoder features
+        self.fusion_conv = nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1)
+        self.fusion_relu = nn.ReLU()
+        
+        self.decoder_final = nn.Sequential(
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),  # Output: [N, 1, 14, 14]
+            nn.Tanh()  # Residual in [-1, 1]
+        )
+        
+        # Crop and upsample to 8x8
+        self.crop = lambda x: x[:, :, 3:11, 3:11]  # Crop 14x14 to 8x8 (center)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+    def forward(self, x):
+        # Input: x [N, 1, 28, 28]
+        # Save input for center slicing
+        input_image = x
+        
+        # Encoder
+        f1 = self.conv1(x)  # Shape: [N, 32, 14, 14] (skip connection)
+        f2 = self.conv2(f1)  # Shape: [N, 64, 7, 7] (bottleneck)
+        
+        # Decoder
+        d1 = self.decoder_up1(f2)  # Shape: [N, 32, 14, 14]
+        
+        # Concatenate skip connection (f1) with decoder features (d1)
+        d1 = torch.cat([f1, d1], dim=1)  # Shape: [N, 32+32, 14, 14]
+        
+        # Fuse concatenated features
+        d1 = self.fusion_conv(d1)  # Shape: [N, 32, 14, 14]
+        d1 = self.fusion_relu(d1)
+        
+        # Final convolution and crop to 8x8
+        residual = self.decoder_final(d1)  # Shape: [N, 1, 14, 14]
+        residual = self.crop(residual)  # Shape: [N, 1, 8, 8]
+        
+        # Combine with input's 8x8 center
+        center_input = input_image[:, :, 10:18, 10:18]  # Shape: [N, 1, 8, 8]
+        output = center_input + residual
+        output = torch.clamp(output, 0, 1)  # Ensure output in [0, 1]
+        
+        return output
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
-
-
-
-import numpy as np
-import torch
-
-def get_data(**kwargs):
+class OneCycleScheduler:
     """
-    Get the training and test data. The data files are assumed to be in the
-    same directory as this script.
-
-    Args:
-    - kwargs: Additional arguments that you might find useful - not necessary
-
-    Returns:
-    - train_data_input: Tensor[N_train_samples, C, H, W]
-    - train_data_label: Tensor[N_train_samples, C, H, W]
-    - test_data_input: Tensor[N_test_samples, C, H, W]
+    Implements 1Cycle Learning Rate and Momentum scheduling.
+    - LR increases from lr_min to lr_max, then decreases to lr_min/100.
+    - Momentum decreases from mom_max to mom_min, then increases back.
     """
-    train_data = np.load("train_data.npz")["data"]  # Shape (N, 28, 28)
-    
-    # Convert to tensor with channel dimension and normalize to [0, 1]
-    train_data = torch.tensor(train_data, dtype=torch.float32) / 255.0  # Shape: (N, 1, 28, 28)
-    
-    # Load test data
-    test_data_input = np.load("test_data.npz")["data"]
-    test_data_input = torch.tensor(test_data_input, dtype=torch.float32) / 255.0  # Shape: (N_test, 1, 28, 28)
-    
-    # Create masked inputs
-    def apply_mask(image):
-        masked_image = image.clone()
-        masked_image[:, 10:18, 10:18] = 0  # Apply mask on spatial dimensions
-        return masked_image
-    
-    # Apply mask while preserving channels
-    train_data_input = torch.stack([apply_mask(img) for img in train_data])
-    train_data_label = train_data.clone()
-    
-    return train_data_input, train_data_label, test_data_input
+    def __init__(self, optimizer, lr_max, mom_max, mom_min, total_steps, div_factor=10, final_div_factor=100):
+        self.optimizer = optimizer
+        self.lr_max = lr_max
+        self.lr_min = lr_max / div_factor
+        self.final_lr = lr_max / final_div_factor
+        self.mom_max = mom_max
+        self.mom_min = mom_min
+        self.total_steps = total_steps
+        self.half_steps = total_steps // 2
+        self.step_count = 0
+        
+    def step(self):
+        self.step_count += 1
+        # Compute interpolation factor (0 to 1 for first half, 1 to 0 for second half)
+        if self.step_count <= self.half_steps:
+            # Phase 1: Increase LR, decrease momentum
+            frac = self.step_count / self.half_steps
+            lr = self.lr_min + frac * (self.lr_max - self.lr_min)
+            mom = self.mom_max - frac * (self.mom_max - self.mom_min)
+        else:
+            # Phase 2: Decrease LR, increase momentum
+            frac = (self.step_count - self.half_steps) / self.half_steps
+            lr = self.lr_max - frac * (self.lr_max - self.final_lr)
+            mom = self.mom_min + frac * (self.mom_max - self.mom_min)
+        
+        # Update optimizer parameters
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+            param_group['momentum'] = mom
 
 def train_model(train_data_input, train_data_label, **kwargs):
     # Set up device
@@ -148,19 +197,28 @@ def train_model(train_data_input, train_data_label, **kwargs):
     huber_criterion = nn.SmoothL1Loss(beta=1.0, reduction='sum')  # Huber loss
     mse_criterion = nn.MSELoss(reduction='sum')  # For tracking MSE
     
-    # Set up optimizer and scheduler
+    # Set up optimizer
     optimizer = optim.SGD(model.parameters(), 
-                         lr=0.01, 
-                         momentum=0.9, 
+                         lr=0.001,  # Initial LR, will be overridden by scheduler
+                         momentum=0.95,  # Initial momentum, will be overridden
                          weight_decay=0.0001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
-                                                    mode='min', 
-                                                    factor=0.1,
-                                                    patience=2,
-                                                    verbose=True)
+    
+    # Set up 1Cycle scheduler
+    total_epochs = 30
+    steps_per_epoch = len(train_loader)
+    total_steps = total_epochs * steps_per_epoch
+    scheduler = OneCycleScheduler(
+        optimizer,
+        lr_max=0.01,           # Max learning rate
+        mom_max=0.95,          # Max momentum
+        mom_min=0.85,          # Min momentum
+        total_steps=total_steps,
+        div_factor=10,         # lr_min = lr_max / div_factor
+        final_div_factor=100   # final_lr = lr_max / final_div_factor
+    )
     
     # Training loop
-    for epoch in range(20):
+    for epoch in range(total_epochs):
         model.train()
         train_mse = 0.0
         
@@ -202,6 +260,9 @@ def train_model(train_data_input, train_data_label, **kwargs):
             loss.backward()
             optimizer.step()
             
+            # Update scheduler
+            scheduler.step()
+            
             # Calculate MSE for tracking
             with torch.no_grad():
                 train_mse += mse_criterion(outputs * center_mask, center_targets * center_mask).item() / (center_mask.sum().item() + 1e-8) * inputs.size(0)
@@ -230,100 +291,17 @@ def train_model(train_data_input, train_data_label, **kwargs):
         
         val_mse /= len(val_dataset)
         
-        # Update learning rate scheduler
-        scheduler.step(val_mse)
-        
-        # Print progress
-        print(f"Epoch [{epoch+1}/20] "
+        # Print progress with current learning rate and momentum
+        current_lr = optimizer.param_groups[0]['lr']
+        current_mom = optimizer.param_groups[0]['momentum']
+        print(f"Epoch [{epoch+1}/{total_epochs}] "
               f"Train MSE: {train_mse:.4f} - "
-              f"Val MSE: {val_mse:.4f}")
+              f"Val MSE: {val_mse:.4f} - "
+              f"LR: {current_lr:.6f} - "
+              f"Momentum: {current_mom:.4f}")
     
     return model
 
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-import torch
-import torch.nn as nn
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-import torch
-import torch.nn as nn
-
-class Model(nn.Module):
-    def __init__(self):
-        super(Model, self).__init__()
-        
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Downsample to 14x14
-            
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)  # Downsample to 7x7
-        )
-        
-        # Decoder: Focus on 8x8 center
-        self.decoder = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1),  # Output: [N, 1, 7, 7]
-            nn.Upsample(size=(8, 8), mode='bilinear', align_corners=False),  # Upsample to 8x8
-            nn.Tanh()  # Residual in [-1, 1]
-        )
-
-    def forward(self, x):
-        # Input: x [N, 1, 28, 28]
-        # Save input for center slicing
-        input_image = x
-        x = self.encoder(x)  # Shape: [N, 64, 7, 7]
-        residual = self.decoder(x)  # Shape: [N, 1, 8, 8]
-        
-        # Combine with input's 8x8 center
-        center_input = input_image[:, :, 10:18, 10:18]  # Shape: [N, 1, 8, 8]
-        output = center_input + residual
-        output = torch.clamp(output, 0, 1)  # Ensure output in [0, 1]
-        
-        return output
-
-
-
-from pathlib import Path
-import numpy as np
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import torch
 
 def test_model(model, test_data_input):
     """
@@ -389,6 +367,8 @@ def test_model(model, test_data_input):
 
             plt.savefig(f"test_image_output/image_{i}.png")
             plt.close()
+
+
 
 def main():
     seed = 0

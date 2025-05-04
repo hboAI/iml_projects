@@ -75,77 +75,95 @@ def get_data(**kwargs):
     return train_data_input, train_data_label, test_data_input
 
 
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, padding=1)
+        )
+    
+    def forward(self, x):
+        return x + self.conv(x)  # Skip connection
+
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
         
-        # Encoder
+        # Enhanced Encoder
         self.conv1 = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)  # Downsample to 14x14
+            ResBlock(32),
+            nn.MaxPool2d(kernel_size=2, stride=2)  # 14x14
         )
         
         self.conv2 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)  # Downsample to 7x7
+            ResBlock(64),
+            nn.MaxPool2d(kernel_size=2, stride=2)  # 7x7
         )
         
-        # Decoder
-        self.decoder_up1 = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),  # Upsample to 14x14
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, dilation=2, padding=2),  # Dilated conv
+            nn.MaxPool2d(kernel_size=2, stride=2)  # 3x3
+        )
+        
+        # Progressive Decoder
+        self.decoder_up2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2),  # 7x7
             nn.ReLU()
         )
         
-        # Fusion convolution to combine skip connection and decoder features
-        self.fusion_conv = nn.Conv2d(65, 32, kernel_size=3, padding=1) 
-        self.fusion_relu = nn.ReLU()
+        self.decoder_up1 = nn.Sequential(
+            nn.ConvTranspose2d(128, 32, kernel_size=2, stride=2),  # 14x14
+            nn.ReLU()
+        )
         
+        # Attention Gate
+        self.attention = nn.Sequential(
+            nn.Conv2d(32+32+1, 32, 1),  # For f1 + d1 + e0_down
+            nn.Sigmoid()
+        )
+        
+        # Final Decoder
         self.decoder_final = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),  # Additional layer
-            nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1),   # Original final layer
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            ResBlock(32),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
             nn.Tanh()
         )
         
-        # Crop and upsample to 8x8
-        self.crop = lambda x: x[:, :, 3:11, 3:11]  # Crop 14x14 to 8x8 (center)
+        self.crop = lambda x: x[:, :, 3:11, 3:11]  # 14x14 -> 8x8 center
 
     def forward(self, x):
-        # Input: x [N, 1, 28, 28]
-        # Save input for center slicing
-        e0 = x
-        input_image = x
-        
         # Encoder
-        f1 = self.conv1(x)  # Shape: [N, 32, 14, 14] (skip connection)
-        f2 = self.conv2(f1)  # Shape: [N, 64, 7, 7] (bottleneck)
+        e0 = x  # Original input
+        f1 = self.conv1(x)  # 32@14x14
+        f2 = self.conv2(f1)  # 64@7x7
+        f3 = self.conv3(f2)  # 128@3x3
         
-        # Decoder
-        d1 = self.decoder_up1(f2)  # Shape: [N, 32, 14, 14]
+        # Decoder with multi-scale skips
+        d2 = self.decoder_up2(f3)  # 64@7x7
+        d2 = torch.cat([d2, f2], dim=1)  # 64+64=128@7x7
         
-        # Concatenate skip connection (f1) with decoder features (d1)
-        d1 = torch.cat([
-              d1,
-              f1,
-              F.avg_pool2d(e0, 2) 
-              ], dim=1)  # Shape: [N, 32+32, 14, 14]
+        d1 = self.decoder_up1(d2)  # 32@14x14
+        e0_down = F.avg_pool2d(e0, 2)  # 1@14x14
         
-        # Fuse concatenated features
-        d1 = self.fusion_conv(d1)  # Shape: [N, 32, 14, 14]
-        d1 = self.fusion_relu(d1)
+        # Attention-guided fusion
+        attn = self.attention(torch.cat([d1, f1, e0_down], dim=1))
+        d1 = d1 * attn  # Weighted features
         
-        # Final convolution and crop to 8x8
-        residual = self.decoder_final(d1)  # Shape: [N, 1, 14, 14]
-        residual = self.crop(residual)  # Shape: [N, 1, 8, 8]
+        # Final reconstruction
+        residual = self.decoder_final(d1)
+        residual = self.crop(residual)
         
-        # Combine with input's 8x8 center
-        center_input = input_image[:, :, 10:18, 10:18]  # Shape: [N, 1, 8, 8]
+        # Combine with input
+        center_input = x[:, :, 10:18, 10:18]
         output = center_input + residual
-        output = torch.clamp(output, 0, 1)  # Ensure output in [0, 1]
-        
-        return output
+        return torch.clamp(output, 0, 1)
 
 
 

@@ -85,7 +85,7 @@ class ResBlock(nn.Module):
         )
     
     def forward(self, x):
-        return x + self.conv(x)  # Skip connection
+        return x + self.conv(x) 
 
 class Model(nn.Module):
     def __init__(self):
@@ -101,30 +101,30 @@ class Model(nn.Module):
         self.conv2 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             ResBlock(64),
-            nn.MaxPool2d(kernel_size=2, stride=2)  # 7x7
+            nn.MaxPool2d(kernel_size=2, stride=2) 
         )
         
         self.conv3 = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, dilation=2, padding=2),  # Dilated conv
+            nn.Conv2d(128, 128, kernel_size=3, dilation=2, padding=2),  
             nn.MaxPool2d(kernel_size=2, stride=2)  # 3x3
         )
         
         # Progressive Decoder
         self.decoder_up2 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2),  # 7x7
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2),  
             nn.ReLU()
         )
         
         self.decoder_up1 = nn.Sequential(
-            nn.ConvTranspose2d(128, 32, kernel_size=2, stride=2),  # 14x14
+            nn.ConvTranspose2d(128, 32, kernel_size=2, stride=2), 
             nn.ReLU()
         )
         
-        # Attention Gate
+        # attention
         self.attention = nn.Sequential(
-            nn.Conv2d(32+32+1, 32, 1),  # For f1 + d1 + e0_down
+            nn.Conv2d(32+32+1, 32, 1), 
             nn.Sigmoid()
         )
         
@@ -136,7 +136,7 @@ class Model(nn.Module):
             nn.Tanh()
         )
         
-        self.crop = lambda x: x[:, :, 3:11, 3:11]  # 14x14 -> 8x8 center
+        self.crop = lambda x: x[:, :, 3:11, 3:11] 
 
     def forward(self, x):
         # Encoder
@@ -167,7 +167,7 @@ class Model(nn.Module):
 
 
 
-
+#other schedulers were ass. found this in a kaggle repo for mnist
 class OneCycleScheduler:
     """
     Implements 1Cycle Learning Rate and Momentum (beta1 for Adam) scheduling.
@@ -199,22 +199,22 @@ class OneCycleScheduler:
             lr = self.lr_max - frac * (self.lr_max - self.final_lr)
             beta1 = self.beta1_min + frac * (self.beta1_max - self.beta1_min)
         
-        # Update optimizer parameters
+
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
             param_group['betas'] = (beta1, param_group['betas'][1])  # Update beta1, keep beta2
 
 def train_model(train_data_input, train_data_label, **kwargs):
-    # Set up device
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
     
-    # Create dataset and split into train/validation
+
     dataset = TensorDataset(train_data_input, train_data_label)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
-    # Create data loaders
+
     batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -223,10 +223,11 @@ def train_model(train_data_input, train_data_label, **kwargs):
     model = kwargs.get('model', Model()).to(device)
     
     # Define loss functions
+    #want to superposition loss functions
     huber_criterion = nn.SmoothL1Loss(beta=1.0, reduction='sum')  # Huber loss
     mse_criterion = nn.MSELoss(reduction='sum')  # For tracking MSE
     
-    # Set up optimizer
+    # maybe sgd also works
     optimizer = optim.Adam(
         model.parameters(),
         lr=0.0001,  # Initial LR, will be overridden by scheduler
@@ -234,7 +235,7 @@ def train_model(train_data_input, train_data_label, **kwargs):
         weight_decay=0.0001
     )
     
-    # Set up 1Cycle scheduler
+
     total_epochs = 50
     steps_per_epoch = len(train_loader)
     total_steps = total_epochs * steps_per_epoch
